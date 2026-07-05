@@ -222,8 +222,6 @@ function TransactionsPage() {
 
   // ---- 新增交易 ----
   // ---- 列宽持久化 ----
-  const restoreFlag = useRef(true);
-
   const saveColumnState = useCallback(() => {
     const api = gridRef.current?.api;
     if (!api) return;
@@ -234,8 +232,6 @@ function TransactionsPage() {
   }, []);
 
   const restoreColumnState = useCallback(() => {
-    if (!restoreFlag.current) return;
-    restoreFlag.current = false;
     try {
       const saved = localStorage.getItem(COL_STATE_KEY);
       if (saved && gridRef.current?.api) {
@@ -247,16 +243,13 @@ function TransactionsPage() {
   const handleFirstDataRendered = useCallback(() => {
     const api = gridRef.current?.api;
     if (!api) return;
-    const hasSaved = !!localStorage.getItem(COL_STATE_KEY);
-    if (!hasSaved) {
-      api.autoSizeAllColumns(false);
-    }
-    setTimeout(() => restoreColumnState(), 50);
+    // 总是先撑满内容，再恢复用户保存的列宽
+    api.autoSizeAllColumns(false);
+    setTimeout(() => restoreColumnState(), 100);
   }, [restoreColumnState]);
 
   // rowData 更新后立即恢复（选中行等操作触发 re-render 后）
   const handleRowDataUpdated = useCallback(() => {
-    restoreFlag.current = true;
     setTimeout(() => restoreColumnState(), 0);
   }, [restoreColumnState]);
 
