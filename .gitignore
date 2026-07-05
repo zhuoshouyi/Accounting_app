@@ -26,3 +26,7 @@ dist-ssr
 # Rust / Tauri
 src-tauri/target
 src-tauri/gen
+
+# 示例账单（含隐私数据）
+docs/*.xlsx
+docs/*.csv
