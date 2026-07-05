@@ -1,0 +1,231 @@
+%% 家庭记账桌面应用 v3 — 核心流程时序图
+%% 包含：账单导入、归属人管理、数据清洗（部分退款）、自动分类+AI辅助(DeepSeek)、月度汇总+下钻、AI报表生成+历史保存
+
+%% ===== 1. 账单导入流程（v3: 归属人联系人管理 + 多月）=====
+sequenceDiagram
+    participant U as 用户
+    participant UI as 前端 UI
+    participant IS as 导入服务
+    participant AO as 归属人服务
+    participant WP as 微信解析器
+    participant AP as 支付宝解析器
+    participant BH as 头部提取器
+    participant DB as 数据库
+
+    U->>UI: 选择账单文件
+    UI->>AO: get_owners()（获取归属人列表）
+    AO->>DB: 查询 account_owners
+    DB-->>AO: Vec~AccountOwner~
+    AO-->>UI: 归属人列表 + "跳过"选项
+
+    U->>UI: 选择归属人（或跳过）
+    UI->>IS: invoke('import_bill', { filePath, source, payer })
+
+    alt source == wechat
+        IS->>WP: parse_wechat_xlsx(filePath)
+        Note over WP: calamine 读取 XLSX<br/>跳过前17行头部<br/>第18行表头<br/>第19行起数据
+        WP->>BH: extract_wechat_header(rows[1..17])
+        BH-->>WP: { nickname: "Vila", stats: {...} }
+        WP-->>IS: { transactions: Vec<RawTx>, header_info }
+    else source == alipay
+        IS->>AP: parse_alipay_csv(filePath)
+        Note over AP: encoding_rs GBK→UTF-8<br/>跳过前22行头部<br/>第23行表头<br/>第24行起数据
+        AP->>BH: extract_alipay_header(lines[1..22])
+        BH-->>AP: { name: "赵紫薇", account: "15730284920" }
+        AP-->>IS: { transactions: Vec<RawTx>, header_info }
+    end
+
+    IS->>IS: 填充支付人（payer = 用户选择，跳过则 null）
+    IS->>IS: 字段标准化（时间精确到秒、收/支/不计收支枚举）
+    IS->>IS: 标记不计收支(direction='neutral', is_excluded=1)
+    IS->>IS: 文件哈希去重检查
+    IS->>IS: 多月数据自动拆分（按 month 字段，自然归属）
+    IS->>DB: 批量插入交易（tag_source=null, payer=用户选择）
+    IS->>DB: 记录导入日志（import_records，含 payer + account_info）
+
+    IS-->>UI: { total, valid, months, header_info }
+    UI-->>U: 展示导入结果
+
+%% ===== 2. 数据清洗流程（v3: 部分退款处理 + 金额过滤）=====
+sequenceDiagram
+    participant U as 用户
+    participant UI as 前端 UI
+    participant CS as 清洗服务
+    participant DB as 数据库
+
+    U->>UI: 点击"数据清洗"按钮
+    UI->>CS: invoke('preview_cleaning', { month })
+
+    CS->>DB: 查询匹配清洗条件的交易
+    Note over CS: 条件1：status IN ('还款成功','交易关闭','退款成功','不计收入')
+    Note over CS: 条件2：amount <= 3
+    Note over CS: 条件3：部分退款交易（需修改状态和金额）
+    DB-->>CS: Vec<Transaction>（待处理列表）
+
+    CS->>CS: 分类处理结果
+    Note over CS: 分类A：待过滤（删除）<br/>= 状态匹配 + 金额≤3
+    Note over CS: 分类B：待修改（部分退款）<br/>退款金额≤3 → 状态改"支付成功"<br/>退款金额>3 → 状态改"部分退款"，金额=支付-退款
+
+    CS-->>UI: { to_delete: [...], to_modify: [...], delete_count, modify_count }
+    UI-->>U: 展示待过滤和待修改数据（两个列表）
+    Note over UI: 列表A：待过滤（时间、对方、商品、金额、状态）<br/>列表B：待修改（原状态→新状态，原金额→新金额）<br/>用户可逐条取消勾选
+
+    U->>UI: 确认/取消勾选 → 点击"确认执行"
+    UI->>CS: invoke('execute_cleaning', { delete_ids: [...], modify_ids: [...] })
+
+    CS->>DB: 待过滤交易 → is_excluded_from_summary=1（软删除）
+    Note over CS: 从汇总明细表移除，原始导入表保留可溯源
+    CS->>DB: 待修改交易 → 更新 status 和 amount
+    Note over CS: 退款金额≤3：status='支付成功'，金额不变<br/>退款金额>3：status='部分退款'，amount=原金额-退款金额
+    DB-->>CS: 更新成功
+
+    CS-->>UI: { deleted: N, modified: M, remaining: K }
+    UI-->>U: 展示清洗结果摘要
+
+%% ===== 3. 自动分类 + AI 辅助流程（v3: DeepSeek + 消费标签可空）=====
+sequenceDiagram
+    participant IS as 导入服务
+    participant CE as 分类引擎
+    participant DB as 数据库
+    participant AI as AI 服务
+    participant LLM as DeepSeek API
+
+    IS->>CE: classify_transactions(month)
+    CE->>DB: 加载所有启用的分类规则（按 priority 排序）
+    DB-->>CE: Vec<CategoryRule>
+
+    CE->>DB: 加载所有启用的 AI 学习规则
+    DB-->>CE: Vec<AiLearningRule>
+
+    CE->>DB: 查询待分类交易（tag_source IS NULL）
+    DB-->>CE: Vec<Transaction>
+
+    loop 遍历每条交易
+        CE->>CE: 第1层：AI 学习规则匹配（优先级最高）
+        alt 学习规则匹配成功
+            CE->>DB: 更新 tag_id, tag_source='auto'
+        else 学习规则未匹配
+            CE->>CE: 第2层：内置分类规则匹配（按 priority）
+            alt 内置规则匹配成功
+                CE->>DB: 更新 tag_id, tag_source='auto'
+            else 内置规则未匹配
+                CE->>CE: 第3层：AI 辅助分类（DeepSeek）
+                alt AI 服务可用
+                    CE->>AI: classify_transaction(transaction)
+                    AI->>LLM: 发送分类请求（交易信息+标签列表）
+                    LLM-->>AI: { tag_id, confidence }
+                    AI-->>CE: AiClassifyResult { suggested_tag, confidence }
+                    CE->>DB: 写入 ai_suggested_tag, ai_confidence
+                    Note over CE: tag_source 暂设为 'ai'（待用户确认）
+                else AI 不可用（离线/未配置）
+                    CE->>DB: 保持 tag_source=null（消费标签留空）
+                    Note over CE: 消费标签非必填，可置空
+                end
+            end
+        end
+    end
+
+    CE-->>IS: { classified, ai_suggested, unclassified }
+
+%% ===== 4. 月度汇总流程（含下钻跳转，月份自然归属）=====
+sequenceDiagram
+    participant U as 用户
+    participant UI as 前端 UI
+    participant SS as 汇总服务
+    participant DB as 数据库
+
+    U->>UI: 选择月份 → 查看汇总
+    UI->>SS: get_monthly_summary(month)
+    SS->>DB: 查询当月交易（is_excluded=0, direction='expense'）
+    Note over SS: 月份自然归属：直接取 transaction_time 的年月
+    DB-->>SS: Vec<Transaction>
+    SS->>DB: 查询汇总映射（summary_mappings）
+    DB-->>SS: Vec<SummaryMapping>
+    SS->>DB: 查询当月手动数据
+    DB-->>SS: MonthlyManualData
+
+    SS->>SS: 按标签 GROUP BY + SUM(amount)
+    SS->>SS: 按汇总映射合并标签到汇总类
+    SS->>SS: 计算总支出 + 各汇总类金额
+    SS-->>UI: MonthlySummaryReport（含每汇总类的标签明细）
+
+    UI-->>U: 渲染月度汇总表
+
+    Note over U,UI: 下钻跳转
+    U->>UI: 点击某汇总类金额（如"家用 1100"）
+    UI->>UI: 路由跳转 /transactions?month=2026-06&tags=日用品,衣服美妆,家具
+    UI->>SS: get_transactions_by_tags(month, tag_ids)
+    SS->>DB: 查询指定月份+标签的交易
+    DB-->>SS: Vec<Transaction>
+    SS-->>UI: 交易明细列表
+    UI-->>U: 展示筛选后的明细（自动应用筛选条件）
+
+%% ===== 5. AI 报表生成 + 历史保存流程（v3: DeepSeek + 报表历史）=====
+sequenceDiagram
+    participant U as 用户
+    participant UI as 前端 UI
+    participant RS as 报表服务
+    participant AI as AI 服务
+    participant LLM as DeepSeek API
+    participant DB as 数据库
+
+    U->>UI: 点击"生成 AI 报表"按钮
+    UI->>RS: invoke('generate_ai_report', { month })
+
+    RS->>DB: 查询当月汇总数据（收支、各分类金额）
+    DB-->>RS: MonthlySummary
+    RS->>DB: 查询近6月趋势数据
+    DB-->>RS: TrendData
+
+    RS->>AI: generate_report_html(month, summary, trend)
+    AI->>AI: 组装 Prompt（数据+HTML生成指令）
+    AI->>LLM: 请求生成 HTML 报表
+    LLM-->>AI: HTML 字符串（含内联CSS）
+    AI->>AI: 安全校验（移除 script 标签等）
+    AI-->>RS: { html, generated_at, model_name }
+
+    RS->>DB: 保存报表到 ai_reports 表（v3 新增）
+    Note over RS: 保存：month, report_type='html_report',<br/>title, content=html, summary_data=快照,<br/>model_name, created_at
+    DB-->>RS: 保存成功
+
+    RS-->>UI: { html_content, report_id }
+    UI-->>U: 在 WebView 中渲染 HTML 报表
+    Note over U: 用户查看报表，可决定是否修改数据
+
+    Note over U,UI: 查看历史报表
+    U->>UI: 点击"报表历史"
+    UI->>RS: invoke('get_report_history', { month })
+    RS->>DB: 查询 ai_reports（按 month 或全部）
+    DB-->>RS: Vec<AiReport>
+    RS-->>UI: 报表历史列表
+    UI-->>U: 展示历史报表（可点击查看任意历史报表）
+
+%% ===== 6. 归属人管理流程（v3 新增）=====
+sequenceDiagram
+    participant U as 用户
+    participant UI as 前端 UI
+    participant AOS as 归属人服务
+    participant DB as 数据库
+
+    Note over U,UI: 场景1：在设置页管理归属人
+    U->>UI: 打开归属人管理页面
+    UI->>AOS: invoke('list_owners')
+    AOS->>DB: SELECT * FROM account_owners ORDER BY sort_order
+    DB-->>AOS: Vec<AccountOwner>
+    AOS-->>UI: 归属人列表
+    UI-->>U: 展示归属人列表
+
+    U->>UI: 点击"新增归属人"→ 输入名字（如 joey）
+    UI->>AOS: invoke('create_owner', { name: 'joey' })
+    AOS->>DB: INSERT INTO account_owners (id, name, sort_order, ...)
+    DB-->>AOS: 插入成功
+    AOS-->>UI: AccountOwner
+    UI-->>U: 列表更新
+
+    Note over U,UI: 场景2：导入账单时选择归属人
+    U->>UI: 选择账单文件 → 弹出归属人选择器
+    UI->>AOS: invoke('list_owners')
+    AOS-->>UI: 归属人列表 + "跳过"选项
+    U->>UI: 选择归属人（或点击"跳过"）
+    Note over UI: 选择归属人 → payer = 该归属人<br/>跳过 → payer = null
+    UI->>IS: invoke('import_bill', { filePath, source, payer })

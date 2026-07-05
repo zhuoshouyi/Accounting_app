@@ -1,0 +1,174 @@
+%% 家庭记账桌面应用 v3 — 类图
+%% 数据结构总览（v3 新增 AccountOwner、AiReport）
+
+classDiagram
+    class AccountOwner {
+        +UUID id
+        +String name
+        +Integer sort_order
+        +DateTime created_at
+        +DateTime updated_at
+    }
+
+    class Transaction {
+        +UUID id
+        +DateTime transaction_time
+        +UUID tag_id
+        +String tag_source
+        +String source
+        +String transaction_type
+        +String counterparty
+        +String product
+        +String direction
+        +Decimal amount
+        +String payment_method
+        +String status
+        +String payer
+        +String payer_source
+        +Boolean is_rigid
+        +Boolean is_excluded_from_summary
+        +UUID ai_suggested_tag
+        +Float ai_confidence
+        +String payment_purpose
+        +String month
+        +JSON raw_data
+        +DateTime created_at
+        +DateTime updated_at
+    }
+
+    class CategoryRule {
+        +UUID id
+        +String match_field
+        +String match_type
+        +String match_value
+        +UUID target_tag_id
+        +Integer priority
+        +Boolean enabled
+        +String source
+        +DateTime created_at
+        +DateTime updated_at
+    }
+
+    class CategoryTag {
+        +UUID id
+        +String name
+        +Boolean is_system
+        +Integer sort_order
+        +DateTime created_at
+    }
+
+    class SummaryMapping {
+        +UUID id
+        +String summary_category
+        +UUID tag_id
+        +Integer sort_order
+        +DateTime created_at
+    }
+
+    class MonthlyManualData {
+        +UUID id
+        +String month
+        +Decimal total_assets
+        +Decimal joey_income
+        +Decimal vila_income
+        +Decimal mortgage_savings
+        +Decimal investment
+        +Decimal insurance
+        +String analysis_text
+        +DateTime created_at
+    }
+
+    class ImportRecord {
+        +UUID id
+        +String month
+        +String source
+        +String payer
+        +String file_name
+        +String file_hash
+        +String account_info
+        +Integer total_count
+        +Integer valid_count
+        +Integer filtered_count
+        +DateTime imported_at
+    }
+
+    class AiLearningRule {
+        +UUID id
+        +String match_field
+        +String match_value
+        +String match_type
+        +UUID target_tag_id
+        +Float confidence
+        +Integer confirm_count
+        +Integer correct_count
+        +String source
+        +Boolean enabled
+        +DateTime created_at
+        +DateTime updated_at
+    }
+
+    class AiReport {
+        +UUID id
+        +String month
+        +String report_type
+        +String title
+        +String content
+        +JSON summary_data
+        +String model_name
+        +DateTime created_at
+    }
+
+    class AppSettings {
+        +String key
+        +String value
+        +String description
+        +DateTime updated_at
+    }
+
+    class AiService {
+        +provider: DeepSeekProvider
+        +api_key: String
+        +model: String
+        +classify_transaction(transaction) AiClassifyResult
+        +analyze_monthly(month, data) String
+        +generate_report_html(month, data) String
+        +is_available() Boolean
+    }
+
+    class ClassificationEngine {
+        +classify_all(month) ClassifyResult
+        +classify_single(transaction) ClassifyResult
+        +match_rules(transaction, rules) UUID
+        +match_ai_learning(transaction, rules) UUID
+        +request_ai_classify(transaction) AiClassifyResult
+        +learn_from_correction(transaction, old_tag, new_tag) void
+    }
+
+    class AccountOwnerService {
+        +list_owners() Vec~AccountOwner~
+        +create_owner(name) AccountOwner
+        +update_owner(id, name) AccountOwner
+        +delete_owner(id) void
+    }
+
+    class ReportService {
+        +generate_ai_report(month) AiReport
+        +get_report_history(month) Vec~AiReport~
+        +get_report_by_id(id) AiReport
+        +save_report(report) void
+    }
+
+    AccountOwner --> Transaction : payer
+    AccountOwner --> ImportRecord : payer
+    Transaction --> CategoryTag : tag_id
+    Transaction --> CategoryTag : ai_suggested_tag
+    CategoryRule --> CategoryTag : target_tag_id
+    SummaryMapping --> CategoryTag : tag_id
+    AiLearningRule --> CategoryTag : target_tag_id
+    AiReport --> Transaction : "基于月度数据生成"
+    ClassificationEngine --> AiService : 调用
+    ClassificationEngine --> CategoryRule : 读取规则
+    ClassificationEngine --> AiLearningRule : 读取学习规则
+    ReportService --> AiService : 调用生成
+    ReportService --> AiReport : 保存历史
+    AccountOwnerService --> AccountOwner : 管理
